@@ -9,6 +9,10 @@
 - run_table_edges        表级血缘边
 - run_column_edges       列级血缘边（含变换链 / star 标记 / 证据行号）
 - run_cycles             环检测结果
+- column_def_versions    列口径版本（按生效账期开窗，pending/active/closed）
+- switch_runs            口径切换 run（确定性主键，重复创建幂等）
+- switch_steps           切换步骤断点（pending/done，恢复只补未完成）
+- period_results         账期重放结果（主键 upsert，重跑不新增重复行）
 """
 from __future__ import annotations
 
@@ -105,6 +109,58 @@ CREATE TABLE IF NOT EXISTS run_cycles (
   scripts_json TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_rc_run ON run_cycles(run_id);
+
+CREATE TABLE IF NOT EXISTS column_def_versions (
+  version_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  table_name TEXT NOT NULL,
+  column_name TEXT NOT NULL,
+  version_no INTEGER NOT NULL,
+  caliber TEXT NOT NULL,
+  expression TEXT NOT NULL,
+  effective_from TEXT NOT NULL,
+  effective_to TEXT,
+  run_id TEXT,
+  status TEXT NOT NULL DEFAULT 'pending',
+  created_at TEXT NOT NULL,
+  UNIQUE(table_name, column_name, version_no)
+);
+CREATE INDEX IF NOT EXISTS idx_cdv_lookup ON column_def_versions(table_name, column_name, status);
+
+CREATE TABLE IF NOT EXISTS switch_runs (
+  switch_id TEXT PRIMARY KEY,
+  table_name TEXT NOT NULL,
+  column_name TEXT NOT NULL,
+  from_version_id INTEGER NOT NULL,
+  to_version_id INTEGER NOT NULL,
+  cutover_period TEXT NOT NULL,
+  status TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS switch_steps (
+  switch_id TEXT NOT NULL,
+  step_key TEXT NOT NULL,
+  step_order INTEGER NOT NULL,
+  action TEXT NOT NULL,
+  object_name TEXT NOT NULL,
+  title TEXT NOT NULL,
+  detail TEXT,
+  status TEXT NOT NULL DEFAULT 'pending',
+  done_at TEXT,
+  PRIMARY KEY (switch_id, step_key)
+);
+
+CREATE TABLE IF NOT EXISTS period_results (
+  period TEXT NOT NULL,
+  table_name TEXT NOT NULL,
+  column_name TEXT NOT NULL,
+  version_no INTEGER NOT NULL,
+  object_name TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  replayed_at TEXT NOT NULL,
+  PRIMARY KEY (period, table_name, column_name, object_name)
+);
 """
 
 
@@ -304,6 +360,8 @@ def stats(conn: sqlite3.Connection) -> dict:
         "broken_scripts": one("SELECT COUNT(*) FROM scripts WHERE set_name = 'broken'"),
         "schema_tables": one("SELECT COUNT(*) FROM schemas"),
         "runs": one("SELECT COUNT(*) FROM runs"),
+        "def_versions": one("SELECT COUNT(*) FROM column_def_versions"),
+        "switches": one("SELECT COUNT(*) FROM switch_runs"),
         "latest_run": (
             dict(conn.execute("SELECT * FROM runs ORDER BY created_at DESC, rowid DESC LIMIT 1").fetchone())
             if one("SELECT COUNT(*) FROM runs")

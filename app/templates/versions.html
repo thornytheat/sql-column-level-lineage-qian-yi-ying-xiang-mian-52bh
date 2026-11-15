@@ -1,0 +1,242 @@
+{% extends "base.html" %}
+{% block title %}口径版本与切换 · {{ app_name }}{% endblock %}
+{% block crumb %}口径版本与切换{% endblock %}
+{% block meta %}{% if switch %}<span class="dot {% if switch.run.status == 'done' %}ok{% else %}warn{% endif %}"></span>{{ table }}.{{ column }} · 切换 {{ switch.run.status }}{% else %}<span class="dot ok"></span>{{ table }}.{{ column }} · {{ version_list|length }} 个口径版本{% endif %}{% endblock %}
+{% block actions %}<a class="btn secondary small" href="/review">复核与导出</a>{% endblock %}
+{% block status_left %}列定义与血缘按生效账期保留版本 · 切换可中断恢复 · 账期重放幂等{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1 class="page-title">口径版本与切换</h1>
+    <p class="page-sub">
+      订单金额从「含税」切到「未税」：列定义与血缘按生效账期各留一份版本，财务按旧账期重放仍拿到旧口径结果，
+      运营从新账期看到新口径；切换可中断（旧版本继续可查），恢复只补未完成步骤，重跑同一账期不新增重复结果。
+    </p>
+  </div>
+</div>
+
+<div class="kpi-strip">
+  <div class="kpi">
+    <div class="k-label">口径版本</div>
+    <div class="k-value">{{ version_list|length }}</div>
+    <div class="k-note mono">{{ table }}.{{ column }}</div>
+  </div>
+  <div class="kpi">
+    <div class="k-label">现役版本</div>
+    <div class="k-value">
+      {% for v in version_list if v.status == 'active' %}v{{ v.version_no }} · {{ v.caliber }}{% else %}—{% endfor %}
+    </div>
+    <div class="k-note">pending 版本对查询不可见</div>
+  </div>
+  <div class="kpi {% if switch and switch.run.status == 'done' %}ok{% endif %}">
+    <div class="k-label">切换状态</div>
+    <div class="k-value">{{ switch.run.status if switch else '未发起' }}</div>
+    <div class="k-note">{% if switch %}{{ switch.steps|selectattr('status','equalto','done')|list|length }} / {{ switch.steps|length }} 步已完成{% else %}选择待生效版本即可创建{% endif %}</div>
+  </div>
+  <div class="kpi">
+    <div class="k-label">当前账期结果</div>
+    <div class="k-value">{{ replay_rows|length }} 行</div>
+    <div class="k-note">{% if period %}账期 {{ period }} · 重跑只更新不新增{% else %}选择账期后可重放{% endif %}</div>
+  </div>
+</div>
+
+<section class="panel" style="margin-bottom:12px">
+  <div class="panel-head">
+    <h2>版本时间线：<span class="mono">{{ table }}.{{ column }}</span></h2>
+    <div class="panel-actions"><span class="tag">按生效账期开窗</span></div>
+  </div>
+  <div class="table-wrap roomy">
+    <table class="dense">
+      <thead>
+        <tr><th>版本</th><th>口径</th><th>列定义表达式</th><th>生效窗口</th><th>状态</th><th>血缘快照</th></tr>
+      </thead>
+      <tbody>
+        {% for v in version_list %}
+        <tr>
+          <td class="mono nowrap">v{{ v.version_no }}</td>
+          <td class="nowrap"><strong>{{ v.caliber }}</strong></td>
+          <td class="mono small">{{ v.expression }}</td>
+          <td class="mono nowrap">[{{ v.effective_from }}, {{ v.effective_to or '至今' }})</td>
+          <td class="nowrap">
+            {% if v.status == 'active' %}<span class="tag ok">现役</span>
+            {% elif v.status == 'pending' %}<span class="tag warn">待生效</span>
+            {% else %}<span class="tag">已关闭 · 历史可查</span>{% endif %}
+          </td>
+          <td class="mono small"><a href="/result/{{ v.run_id }}">{{ v.run_id[:18] }}…</a></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div class="panel-actions">
+    <span class="small muted" style="align-self:center">
+      每个版本挂一份独立解析快照（run），互不覆盖 —— 不原地改列（避免历史漂移），也不长期双写（窗口闭合后旧版只用于重放）。
+    </span>
+  </div>
+</section>
+
+<div class="split result">
+  <section class="panel">
+    <div class="panel-head">
+      <h2>按账期查询</h2>
+      <div class="panel-actions">{% if query %}<span class="tag ok">v{{ query.version.version_no }} · {{ query.version.caliber }}</span>{% endif %}</div>
+    </div>
+    <div class="panel-body">
+      <form method="get" action="/versions">
+        <input type="hidden" name="table" value="{{ table }}">
+        <input type="hidden" name="column" value="{{ column }}">
+        <div class="toolbar">
+          <label class="small muted" for="period">账期</label>
+          <input type="text" name="period" id="period" value="{{ period }}" placeholder="YYYY-MM，如 2026-09 / 2026-11"
+                 pattern="\d{4}-(0[1-9]|1[0-2])" aria-label="账期" style="width:220px">
+          <button type="submit" class="small">按账期选版查询</button>
+          {% if period %}
+          <button type="submit" form="replay-form" class="small secondary">重放账期 {{ period }}</button>
+          {% endif %}
+        </div>
+      </form>
+      <form method="post" action="/versions/replay" id="replay-form">
+        <input type="hidden" name="table" value="{{ table }}">
+        <input type="hidden" name="column" value="{{ column }}">
+        <input type="hidden" name="period" value="{{ period }}">
+      </form>
+
+      {% if query %}
+      <div class="alert alert-info small" style="margin:10px 0">
+        账期 <strong>{{ period }}</strong> 命中版本 <strong>v{{ query.version.version_no }}（{{ query.version.caliber }}）</strong>：
+        <span class="mono">{{ query.version.expression }}</span>
+        · 窗口 <span class="mono">[{{ query.version.effective_from }}, {{ query.version.effective_to or '至今' }})</span>
+        · 快照 <span class="mono">{{ query.version.run_id }}</span>
+      </div>
+      {% if query.impact.downstream %}
+      <div class="table-wrap">
+        <table class="dense">
+          <thead><tr><th>层级</th><th>下游对象</th><th>类型</th><th>关系</th><th>受影响列</th></tr></thead>
+          <tbody>
+            {% for it in query.impact.downstream %}
+            <tr>
+              <td>{% if it.level is none %}<span class="tag err">环内</span>{% else %}L{{ it.level }}{% endif %}</td>
+              <td class="mono nowrap">{{ it.object }}</td>
+              <td>{{ '视图' if it.kind == 'view' else '表' }}</td>
+              <td>{% if it.relation == 'direct' %}<span class="tag warn">直接</span>{% else %}<span class="tag">间接</span>{% endif %}</td>
+              <td class="mono small">{{ it.columns|join(', ') }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% endif %}
+      {% elif period and not error %}
+      <div class="empty"><strong>该账期没有可展示的版本结果</strong></div>
+      {% else %}
+      <p class="small muted" style="margin:6px 0 0">
+        财务场景：输入旧账期（如 2026-09）→ 命中含税 v1，重放结果与旧报表一致；
+        运营场景：输入新账期（如 2026-11）→ 切换完成后命中未税 v2。波及对象与执行顺序同样按账期选版。
+      </p>
+      {% endif %}
+
+      {% if period and replay_rows %}
+      <h3 class="small" style="margin:12px 0 4px">账期 {{ period }} 的重放结果（{{ replay_rows|length }} 行，重跑不新增）</h3>
+      <div class="table-wrap">
+        <table class="dense">
+          <thead><tr><th>下游对象</th><th>版本</th><th>口径</th><th>层级</th><th>重放时间</th></tr></thead>
+          <tbody>
+            {% for r in replay_rows %}
+            <tr>
+              <td class="mono nowrap">{{ r.object_name }}</td>
+              <td class="mono">v{{ r.version_no }}</td>
+              <td>{{ r.payload.caliber }}</td>
+              <td>{% if r.payload.level is none %}环内{% else %}L{{ r.payload.level }}{% endif %}</td>
+              <td class="mono small nowrap">{{ r.replayed_at }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% endif %}
+    </div>
+  </section>
+
+  <section class="panel pane-sticky">
+    <div class="panel-head">
+      <h2>切换控制台</h2>
+      <div class="panel-actions">
+        {% if switch %}<span class="tag {% if switch.run.status == 'done' %}ok{% elif switch.run.status == 'interrupted' %}err{% else %}warn{% endif %}">{{ switch.run.status }}</span>{% endif %}
+      </div>
+    </div>
+    <div class="panel-body">
+      {% if not switch %}
+        {% if pending_versions %}
+        <p class="small muted" style="margin-top:0">
+          待生效版本：{% for v in pending_versions %}v{{ v.version_no }}（{{ v.caliber }}，{{ v.effective_from }} 起）{{ '、' if not loop.last }}{% endfor %}。
+          创建计划时，波及对象与执行顺序取自新版本（切换账期）的血缘快照。
+        </p>
+        {% for v in pending_versions %}
+        <form method="post" action="/versions/switch/create" style="margin-bottom:8px">
+          <input type="hidden" name="table" value="{{ table }}">
+          <input type="hidden" name="column" value="{{ column }}">
+          <input type="hidden" name="period" value="{{ period }}">
+          <input type="hidden" name="to_version_id" value="{{ v.version_id }}">
+          <input type="hidden" name="cutover_period" value="{{ v.effective_from }}">
+          <button type="submit" class="small">创建切换计划：v{{ v.version_no }} {{ v.caliber }} · 切换账期 {{ v.effective_from }}</button>
+        </form>
+        {% endfor %}
+        {% else %}
+        <div class="empty"><strong>没有待生效的版本</strong>所有版本都已生效或关闭；可用 POST /api/versions 登记下一个口径版本。</div>
+        {% endif %}
+      {% else %}
+      <p class="small muted" style="margin-top:0">
+        切换 <span class="mono">{{ switch.run.switch_id }}</span> · 切换账期 <span class="mono">{{ switch.run.cutover_period }}</span>。
+        每步一个断点；中断时旧版本对所有账期继续可查，恢复只补未完成步骤。
+      </p>
+      <ol class="steps">
+        {% for s in switch.steps %}
+        <li style="display:block">
+          <div>
+            <strong>{{ s.step_order }}. {{ s.title }}</strong>
+            {% if s.status == 'done' %}<span class="tag ok">done</span>{% else %}<span class="tag warn">pending</span>{% endif %}
+          </div>
+          <div class="small muted">{{ s.detail }}</div>
+          {% if s.done_at %}<div class="small mono muted">完成于 {{ s.done_at }}</div>{% endif %}
+        </li>
+        {% endfor %}
+      </ol>
+      <div class="toolbar" style="margin-top:10px">
+        {% if switch.run.status != 'done' %}
+        <form method="post" action="/versions/switch/{{ switch.run.switch_id }}/execute">
+          <input type="hidden" name="table" value="{{ table }}"><input type="hidden" name="column" value="{{ column }}"><input type="hidden" name="period" value="{{ period }}">
+          <button type="submit" class="small">执行全部剩余步骤</button>
+        </form>
+        <form method="post" action="/versions/switch/{{ switch.run.switch_id }}/execute">
+          <input type="hidden" name="table" value="{{ table }}"><input type="hidden" name="column" value="{{ column }}"><input type="hidden" name="period" value="{{ period }}">
+          <input type="hidden" name="stop_after" value="2">
+          <button type="submit" class="small secondary">跑 2 步后模拟中断</button>
+        </form>
+        {% if switch.run.status == 'interrupted' %}
+        <form method="post" action="/versions/switch/{{ switch.run.switch_id }}/resume">
+          <input type="hidden" name="table" value="{{ table }}"><input type="hidden" name="column" value="{{ column }}"><input type="hidden" name="period" value="{{ period }}">
+          <button type="submit" class="small">恢复执行（只补未完成）</button>
+        </form>
+        {% endif %}
+        {% else %}
+        <span class="tag ok">切换完成：新账期走新口径，旧账期仍可重放旧口径</span>
+        {% endif %}
+      </div>
+      {% endif %}
+    </div>
+  </section>
+</div>
+
+<details class="help" style="margin-top:12px">
+  <summary>API 调用方式（版本 / 切换 / 账期查询 / 重放）</summary>
+  <pre>curl -s http://127.0.0.1:18214/api/versions?table=dwd_order&column=amount</pre>
+  <pre>curl -s "http://127.0.0.1:18214/api/query?table=dwd_order&column=amount&period=2026-09"</pre>
+  <pre>curl -s -X POST http://127.0.0.1:18214/api/switch -H 'Content-Type: application/json' \
+  -d '{"table":"dwd_order","column":"amount","to_version_id":2,"cutover_period":"2026-11"}'</pre>
+  <pre>curl -s -X POST http://127.0.0.1:18214/api/switch/&lt;switch_id&gt;/execute -H 'Content-Type: application/json' -d '{"stop_after":2}'
+curl -s -X POST http://127.0.0.1:18214/api/switch/&lt;switch_id&gt;/resume</pre>
+  <pre>curl -s -X POST http://127.0.0.1:18214/api/replay -H 'Content-Type: application/json' \
+  -d '{"table":"dwd_order","column":"amount","period":"2026-09"}'</pre>
+</details>
+{% endblock %}

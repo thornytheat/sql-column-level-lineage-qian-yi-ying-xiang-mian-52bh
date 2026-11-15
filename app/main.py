@@ -4,13 +4,14 @@ from __future__ import annotations
 import sqlite3
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import urlencode
 
 from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from . import graph, migrate, pipeline, report, seed, settings, store
+from . import graph, migrate, pipeline, report, seed, settings, store, switching, versions
 
 BASE = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE / "templates"))
@@ -27,6 +28,7 @@ async def lifespan(app: FastAPI):
         store.init_schema(conn)
         try:
             app.state.seed_info = seed.ensure_seed(conn)
+            app.state.version_seed_info = seed.ensure_version_seed(conn)
         except FileNotFoundError:
             app.state.seed_info = {"seeded": False, "reason": "未找到 sample_data，跳过 seed"}
     finally:
@@ -325,6 +327,152 @@ def review_page(
 
 
 # --------------------------------------------------------------------------
+# 口径版本与切换（页面 + 表单）
+# --------------------------------------------------------------------------
+
+def _versions_context(request: Request, conn, table: str, column: str, period: str | None) -> dict:
+    ctx = base_context(request, "versions")
+    version_list = switching.list_versions(conn, table, column)
+    sw = switching.latest_switch(conn, table, column)
+    query = None
+    replay_rows: list[dict] = []
+    page_error = None
+    if period:
+        try:
+            query = switching.query_column(conn, table, column, period)
+        except versions.VersionError as exc:
+            page_error = str(exc)
+        replay_rows = switching.period_results(conn, table, column, period)
+    ctx.update(
+        {
+            "table": table,
+            "column": column,
+            "period": period or "",
+            "version_list": version_list,
+            "pending_versions": [v for v in version_list if v["status"] == "pending"],
+            "switch": sw,
+            "query": query,
+            "replay_rows": replay_rows,
+            "error": page_error,
+        }
+    )
+    return ctx
+
+
+@app.get("/versions", response_class=HTMLResponse)
+def versions_page(
+    request: Request,
+    table: str = "dwd_order",
+    column: str = "amount",
+    period: str | None = None,
+    notice: str | None = None,
+):
+    conn = get_conn()
+    try:
+        ctx = _versions_context(request, conn, table, column, period)
+        if notice:
+            ctx["notice"] = notice
+    finally:
+        conn.close()
+    return templates.TemplateResponse(request, "versions.html", ctx)
+
+
+def _versions_redirect(table: str, column: str, period: str | None = None, notice: str | None = None, error: str | None = None) -> RedirectResponse:
+    params = {"table": table, "column": column}
+    if period:
+        params["period"] = period
+    if notice:
+        params["notice"] = notice
+    if error:
+        params["error"] = error
+    return RedirectResponse(url=f"/versions?{urlencode(params)}", status_code=303)
+
+
+@app.post("/versions/switch/create")
+async def create_switch_form(request: Request):
+    form = await request.form()
+    table = str(form.get("table") or "dwd_order")
+    column = str(form.get("column") or "amount")
+    period = str(form.get("period") or "") or None
+    conn = get_conn()
+    try:
+        try:
+            sw = switching.start_switch(
+                conn, table, column, int(form.get("to_version_id")), str(form.get("cutover_period") or "")
+            )
+        except versions.VersionError as exc:
+            return _versions_redirect(table, column, period, error=str(exc))
+    finally:
+        conn.close()
+    created = "已创建" if sw.get("created") else "已存在（重复创建幂等，返回同一切换）"
+    return _versions_redirect(table, column, period, notice=f"切换计划{created}：{sw['run']['switch_id']}，共 {len(sw['steps'])} 步")
+
+
+@app.post("/versions/switch/{switch_id}/execute")
+async def execute_switch_form(request: Request, switch_id: str):
+    form = await request.form()
+    table = str(form.get("table") or "dwd_order")
+    column = str(form.get("column") or "amount")
+    period = str(form.get("period") or "") or None
+    stop_raw = str(form.get("stop_after") or "").strip()
+    stop_after = int(stop_raw) if stop_raw.isdigit() else None
+    conn = get_conn()
+    try:
+        try:
+            result = switching.execute_switch(conn, switch_id, stop_after=stop_after)
+        except versions.VersionError as exc:
+            return _versions_redirect(table, column, period, error=str(exc))
+    finally:
+        conn.close()
+    status_text = {"done": "已全部完成", "interrupted": "已中断（旧版本继续可查）", "running": "部分完成"}.get(result["status"], result["status"])
+    return _versions_redirect(table, column, period, notice=f"本次执行 {result['executed']} 步 · {status_text}")
+
+
+@app.post("/versions/switch/{switch_id}/resume")
+async def resume_switch_form(request: Request, switch_id: str):
+    form = await request.form()
+    table = str(form.get("table") or "dwd_order")
+    column = str(form.get("column") or "amount")
+    period = str(form.get("period") or "") or None
+    conn = get_conn()
+    try:
+        try:
+            result = switching.execute_switch(conn, switch_id)
+        except versions.VersionError as exc:
+            return _versions_redirect(table, column, period, error=str(exc))
+    finally:
+        conn.close()
+    return _versions_redirect(
+        table, column, period, notice=f"恢复执行：补跑 {result['executed']} 个未完成步骤 · 状态 {result['status']}"
+    )
+
+
+@app.post("/versions/replay")
+async def replay_period_form(request: Request):
+    form = await request.form()
+    table = str(form.get("table") or "dwd_order")
+    column = str(form.get("column") or "amount")
+    period = str(form.get("period") or "")
+    conn = get_conn()
+    try:
+        try:
+            result = switching.replay_period(conn, table, column, period)
+        except versions.VersionError as exc:
+            return _versions_redirect(table, column, period or None, error=str(exc))
+    finally:
+        conn.close()
+    return _versions_redirect(
+        table,
+        column,
+        period,
+        notice=(
+            f"账期 {period} 已按 v{result['version_no']}（{result['caliber']}）重放，"
+            f"覆盖 {result['object_count']} 个下游对象；重跑同一账期只更新不新增。"
+        ),
+    )
+
+
+# --------------------------------------------------------------------------
 # API
 # --------------------------------------------------------------------------
 
@@ -343,6 +491,8 @@ def health():
         "broken_scripts": stats["broken_scripts"],
         "schema_tables": stats["schema_tables"],
         "runs": stats["runs"],
+        "def_versions": stats["def_versions"],
+        "switches": stats["switches"],
     }
 
 
@@ -441,16 +591,28 @@ def api_tables(run_id: str | None = None):
         conn.close()
 
 
-def _impact_for(run_id: str, table: str, column: str | None) -> tuple[dict, dict, dict]:
+def _impact_for(run_id: str, table: str, column: str | None, period: str | None = None) -> tuple[dict, dict, dict, dict | None]:
+    """计算影响面；带 period 时按账期解析口径版本，用该版本的快照替代传入的 run_id。"""
     conn = get_conn()
     try:
+        version = None
+        if period:
+            try:
+                version = switching.resolve(conn, table, column or "", period)
+            except versions.VersionError as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
+            if version is None:
+                raise HTTPException(
+                    status_code=400, detail=f"{table}.{column or ''} 在账期 {period} 没有已生效的口径版本"
+                )
+            run_id = version["run_id"]
         data, levels = _run_graph(conn, run_id)
         if data is None:
             raise HTTPException(status_code=404, detail=f"找不到运行记录 {run_id}")
         if not table:
             raise HTTPException(status_code=400, detail="缺少 table 参数（例如 ods_orders）")
         impact = graph.impact(data["table_edges"], data["column_edges"], levels, table, column or None)
-        return data, levels, impact
+        return data, levels, impact, version
     finally:
         conn.close()
 
@@ -461,9 +623,14 @@ def api_impact(payload: dict = Body(default={})):
     table = str(payload.get("table") or "")
     column = payload.get("column")
     column = str(column) if column not in (None, "") else None
-    data, levels, impact = _impact_for(run_id, table, column)
+    period = payload.get("period")
+    period = str(period) if period not in (None, "") else None
+    data, levels, impact, version = _impact_for(run_id, table, column, period)
     if not impact["found"]:
         raise HTTPException(status_code=400, detail=impact["message"])
+    if version is not None:
+        impact["version"] = version
+        impact["run_id"] = version["run_id"]
     return impact
 
 
@@ -473,6 +640,8 @@ def api_migration(payload: dict = Body(default={})):
     table = str(payload.get("table") or "")
     column = payload.get("column")
     column = str(column) if column not in (None, "") else None
+    period = payload.get("period")
+    period = str(period) if period not in (None, "") else None
     operation = str(payload.get("operation") or "drop")
     new_name = payload.get("new_name")
     new_name = str(new_name) if new_name not in (None, "") else None
@@ -482,11 +651,13 @@ def api_migration(payload: dict = Body(default={})):
         raise HTTPException(status_code=400, detail="迁移清单必须指定列，例如 ods_orders.amount")
     if operation == "rename" and not new_name:
         raise HTTPException(status_code=400, detail="改名操作必须提供 new_name")
-    data, levels, impact = _impact_for(run_id, table, column)
+    data, levels, impact, version = _impact_for(run_id, table, column, period)
     if not impact["found"]:
         raise HTTPException(status_code=400, detail=impact["message"])
     plan = migrate.plan_migration(impact, operation, new_name, data["cycles"])
-    plan["run_id"] = run_id
+    plan["run_id"] = version["run_id"] if version is not None else run_id
+    if version is not None:
+        plan["version"] = version
     plan["impact"] = impact
     return plan
 
@@ -523,7 +694,7 @@ def api_export(run_id: str, format: str = "json"):
 
 @app.get("/api/runs/{run_id}/impact_export")
 def api_impact_export(run_id: str, table: str, column: str | None = None, operation: str = "drop", new_name: str | None = None):
-    data, levels, impact = _impact_for(run_id, table, column)
+    data, levels, impact, _version = _impact_for(run_id, table, column)
     if not impact["found"]:
         raise HTTPException(status_code=400, detail=impact["message"])
     plan = migrate.plan_migration(impact, operation, new_name, data["cycles"])
@@ -533,3 +704,177 @@ def api_impact_export(run_id: str, table: str, column: str | None = None, operat
             "Content-Disposition": f'attachment; filename="lineagex_{table}_{column or "all"}_impact.json"'
         },
     )
+
+
+# --------------------------------------------------------------------------
+# 口径版本 / 切换 / 账期查询与重放 API
+# --------------------------------------------------------------------------
+
+@app.get("/api/versions")
+def api_list_versions(table: str | None = None, column: str | None = None):
+    conn = get_conn()
+    try:
+        return {"versions": switching.list_versions(conn, table or None, column or None)}
+    finally:
+        conn.close()
+
+
+@app.post("/api/versions")
+def api_create_version(payload: dict = Body(default={})):
+    table = str(payload.get("table") or "").strip()
+    column = str(payload.get("column") or "").strip()
+    caliber = str(payload.get("caliber") or "")
+    expression = str(payload.get("expression") or "")
+    effective_from = str(payload.get("effective_from") or "")
+    if not table or not column:
+        raise HTTPException(status_code=400, detail="缺少 table / column 参数")
+    patch = None
+    patch_sql = payload.get("patch_sql")
+    patch_filename = payload.get("patch_filename")
+    if patch_sql:
+        if not patch_filename:
+            raise HTTPException(status_code=400, detail="patch_sql 需要同时给出 patch_filename（样例脚本名）")
+        patch = {str(patch_filename): str(patch_sql)}
+    conn = get_conn()
+    try:
+        try:
+            version = switching.create_version(
+                conn, table, column, caliber, expression, effective_from, patch=patch
+            )
+        except versions.VersionError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return {"version": version, "versions": switching.list_versions(conn, table, column)}
+    finally:
+        conn.close()
+
+
+@app.get("/api/query")
+def api_query_by_period(table: str, column: str, period: str):
+    conn = get_conn()
+    try:
+        try:
+            query = switching.query_column(conn, table, column, period)
+        except versions.VersionError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return {
+            "table": query["table"],
+            "column": query["column"],
+            "period": query["period"],
+            "version": query["version"],
+            "downstream": query["impact"]["downstream"],
+            "object_count": query["impact"]["object_count"],
+            "edges": query["edges"],
+        }
+    finally:
+        conn.close()
+
+
+@app.post("/api/switch")
+def api_start_switch(payload: dict = Body(default={})):
+    table = str(payload.get("table") or "").strip()
+    column = str(payload.get("column") or "").strip()
+    to_version_id = payload.get("to_version_id")
+    cutover_period = str(payload.get("cutover_period") or "")
+    if not table or not column or to_version_id is None:
+        raise HTTPException(status_code=400, detail="缺少 table / column / to_version_id 参数")
+    conn = get_conn()
+    try:
+        try:
+            sw = switching.start_switch(conn, table, column, int(to_version_id), cutover_period)
+        except versions.VersionError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return {
+            "switch_id": sw["run"]["switch_id"],
+            "created": sw.get("created", False),
+            "status": sw["run"]["status"],
+            "step_count": len(sw["steps"]),
+            "steps": sw["steps"],
+        }
+    finally:
+        conn.close()
+
+
+@app.get("/api/switch/{switch_id}")
+def api_get_switch(switch_id: str):
+    conn = get_conn()
+    try:
+        sw = switching.get_switch(conn, switch_id)
+        if sw is None:
+            raise HTTPException(status_code=404, detail=f"找不到切换 {switch_id}")
+        done = sum(1 for s in sw["steps"] if s["status"] == "done")
+        return {
+            "switch_id": switch_id,
+            "run": sw["run"],
+            "steps": sw["steps"],
+            "done_steps": done,
+            "pending_steps": len(sw["steps"]) - done,
+        }
+    finally:
+        conn.close()
+
+
+@app.post("/api/switch/{switch_id}/execute")
+def api_execute_switch(switch_id: str, payload: dict = Body(default={})):
+    stop_after = payload.get("stop_after")
+    stop_after = int(stop_after) if stop_after is not None else None
+    conn = get_conn()
+    try:
+        try:
+            result = switching.execute_switch(conn, switch_id, stop_after=stop_after)
+        except versions.VersionError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        return {
+            "switch_id": switch_id,
+            "executed": result["executed"],
+            "status": result["status"],
+            "steps": result["switch"]["steps"],
+        }
+    finally:
+        conn.close()
+
+
+@app.post("/api/switch/{switch_id}/resume")
+def api_resume_switch(switch_id: str):
+    conn = get_conn()
+    try:
+        try:
+            result = switching.execute_switch(conn, switch_id)
+        except versions.VersionError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        return {
+            "switch_id": switch_id,
+            "executed": result["executed"],
+            "status": result["status"],
+            "steps": result["switch"]["steps"],
+        }
+    finally:
+        conn.close()
+
+
+@app.post("/api/replay")
+def api_replay(payload: dict = Body(default={})):
+    table = str(payload.get("table") or "").strip()
+    column = str(payload.get("column") or "").strip()
+    period = str(payload.get("period") or "")
+    if not table or not column:
+        raise HTTPException(status_code=400, detail="缺少 table / column 参数")
+    conn = get_conn()
+    try:
+        try:
+            result = switching.replay_period(conn, table, column, period)
+        except versions.VersionError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        result["stored_rows"] = len(switching.period_results(conn, table, column, period))
+        return result
+    finally:
+        conn.close()
+
+
+@app.get("/api/replay")
+def api_replay_results(table: str, column: str, period: str):
+    conn = get_conn()
+    try:
+        rows = switching.period_results(conn, table, column, period)
+        return {"period": period, "table": table, "column": column, "count": len(rows), "results": rows}
+    finally:
+        conn.close()

@@ -9,6 +9,42 @@
 - 环检测：表级与列级依赖图 DFS 三色，输出环路径与产生环的脚本行。
 - 影响面：输入表或列，按拓扑层级从浅到深列出全部下游对象，标注直接 / 间接与受影响列。
 - 迁移清单：删列 / 改名 → 生成有序步骤（冻结 → 逐层改下游 → 回填物理表 → 最后 DDL），附导出的 JSON / CSV。
+- **口径版本与切换**：列定义与血缘按生效账期各留一份版本（不原地改、不长期双写）；波及对象 / 执行顺序 / 查询都按账期选版；切换可中断恢复，账期重放幂等。
+
+## 口径版本与切换（订单金额：含税 → 未税）
+
+场景：`dwd_order.amount` 从含税口径切到未税口径。财务要按账期重放旧报表（结果必须与当时一致），运营要马上看到新口径。只改一列会让历史结果漂移，长期双写又让两套金额都可能被当成事实 —— 所以按生效账期保留版本：
+
+| 规则 | 说明 | 异常态 |
+|---|---|---|
+| 版本 | 每个版本 = 口径 + 列定义表达式 + 生效窗口 `[effective_from, effective_to)` + 独立解析快照（run）；状态 pending → active → closed | 账期格式非 `YYYY-MM`、与待生效版本窗口重叠 → 400 |
+| 选版 | 查询 / 波及对象 / 执行顺序 / 重放都按账期命中版本；active 与 closed 可见，pending 不可见 | 账期无版本覆盖 → 400，不静默选版 |
+| 切换 | 计划取自新版本快照（冻结 → 逐层改写 → 回填 → 切定义 → 最后关闭旧窗口）；每步一个断点 | 中断时旧版本对所有账期继续可查；恢复只补 pending 步骤 |
+| 幂等 | switch_id 由版本对确定（重复创建返回同一个）；步骤条件更新；账期结果主键 upsert | 重跑同一账期 / 重复执行已完成的切换 → 不新增重复结果 |
+
+seed 自带演示数据：`dwd_order.amount` v1 含税（2025-01 起，现役）+ v2 未税（2026-11 起，待生效，表达式 `ROUND(CAST(o.amount AS DECIMAL(18,2)) / 1.13, 2)`）。
+
+```bash
+# 版本列表 / 按账期查询（旧账期 → v1 含税）
+curl -s "http://127.0.0.1:18214/api/versions?table=dwd_order&column=amount"
+curl -s "http://127.0.0.1:18214/api/query?table=dwd_order&column=amount&period=2026-09"
+
+# 创建切换计划（幂等）→ 跑 2 步模拟中断 → 恢复（只补未完成）
+curl -s -X POST http://127.0.0.1:18214/api/switch -H 'Content-Type: application/json' \
+  -d '{"table":"dwd_order","column":"amount","to_version_id":2,"cutover_period":"2026-11"}'
+curl -s -X POST http://127.0.0.1:18214/api/switch/sw_dwd_order_amount_v1_v2/execute \
+  -H 'Content-Type: application/json' -d '{"stop_after":2}'
+curl -s -X POST http://127.0.0.1:18214/api/switch/sw_dwd_order_amount_v1_v2/resume
+
+# 账期重放（重跑同一账期只更新不新增）；影响面 / 迁移清单也支持 period 选版
+curl -s -X POST http://127.0.0.1:18214/api/replay -H 'Content-Type: application/json' \
+  -d '{"table":"dwd_order","column":"amount","period":"2026-09"}'
+curl -s -X POST http://127.0.0.1:18214/api/impact -H 'Content-Type: application/json' \
+  -d '{"table":"dwd_order","column":"amount","period":"2026-09"}'
+```
+
+页面 `/versions`：版本时间线、按账期查询、切换控制台（创建 / 执行 / 模拟中断 / 恢复）、账期重放。
+
 
 ## 核心规则
 
@@ -42,7 +78,7 @@ open http://127.0.0.1:18214/
 
 ## API / 页面
 
-页面：`/`（场景与样例概览）、`/workbench`（录入与执行）、`/result/{run_id}`（结论与依据）、`/review`（影响面 + 迁移 + 导出）。
+页面：`/`（场景与样例概览）、`/workbench`（录入与执行）、`/result/{run_id}`（结论与依据）、`/review`（影响面 + 迁移 + 导出）、`/versions`（口径版本与切换）。
 
 API：
 
@@ -74,13 +110,15 @@ app/
   lineage.py     # 列级血缘：别名传播、函数变换链、star 展开、诊断
   graph.py       # 环（三色 DFS）、拓扑层级、影响面
   migrate.py     # 迁移清单生成
+  versions.py    # 口径版本：窗口解析、切换计划、步骤拍平（纯函数）
+  switching.py   # 切换编排：版本登记、断点执行、账期查询与重放
   pipeline.py    # 编排：读样例 → 解析 → 建图 → 落库
   store.py       # SQLite 表与读写
-  seed.py        # 幂等 seed + 基线解析
+  seed.py        # 幂等 seed + 基线解析 + 口径版本演示数据
   report.py      # 分组视图、诊断片段、导出
   main.py        # FastAPI 路由（薄）
 sample_data/sql/（12 个）、sql_broken/（1 个）、schemas/（7 张表）
-tests/           # parser / lineage / graph / api
+tests/           # parser / lineage / graph / api / versions
 ```
 
 ## 已知限制
@@ -89,4 +127,5 @@ tests/           # parser / lineage / graph / api
 - 视图前向引用可解析（先登记目标列名），但依赖 `SELECT *` 的循环引用无法展开，会报未知表/列诊断。
 - 聚合不改变「源列身份」：`SUM(amount)` 的边仍指向 `amount`，不做粒度语义推断。
 - 环内对象的拓扑层级标记为未知，迁移清单会单列一步提示先处理环。
+- 口径版本的快照以「样例脚本集 + 补丁脚本」重放生成；切换执行是断点编排演示，不连真实调度器、不执行真实 DDL / 回填。
 - 仅离线样例仓库演示；不连接真实数据库、不执行 SQL。
